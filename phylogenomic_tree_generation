@@ -1,0 +1,715 @@
+# Phylogenomic Tree Generation 
+
+So the general pipeline for this is 
+
+1. Proteome Selection
+2. Identifying and Extracting Orthologs
+3. Alignment of Orthologs
+4. Cleaning Alignments <br>
+(4.A. Completing Orthologs if not using Single Copies)
+5. Concatenation
+6. Running RAxML
+
+This is a more manual you do every step kind of thing. There is a program, `orthofinder` that runs all steps, all you do is give input proteomes/genomes and then it will give you your orthologs and the tree at the end. 
+
+As it runs all the steps it can have long run times, and if you have alot of species present, it most probably wont complete. You can benchmark and run steps in `othrofinder`, but I have found over 30 species it is better to do the manual pipeline above. 
+
+
+## Miniconda and Environmnets
+
+I do most of this through `conda/mamba` environments on the supercomputer. And I like to house it in my `/projects/$USER` area. 
+
+```
+/home/beyo2625                         632M          1.4G           2.0G
+/projects/beyo2625                     151G          100G           250G
+/scratch/alpine1                      5579G         3958G          9537G
+/pl/active/fungi1                     6685G          315G          7000G
+Allocated Space: 7.0T
+Available Space: 316G
+Used Space: 6.7T
+```
+
+```{bash downlaoding and installing conda in your project space}
+cd /project/$USER
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+bash Miniforge3-$(uname)-$(uname -m).sh
+
+# make it in your project space as home has so little space 
+# /projects/username/miniforge3
+# select yes for conda to init. 
+```
+
+Then you need to set the conda/mamba channels. This is where all programs and dependencies are stored. 
+
+Then you need to relogin so all the changes take effect. 
+
+```{bash adding channel priorities}
+conda config --add channels defaults
+conda config --add channels conda-forge
+conda config --add channels bioconda
+```
+
+And once installed and initialized you can make environments with programs and their dependencies. The order is important so keep it like this.
+
+```{bash proteinortho env}
+mamba create -y -n proteinortho_env proteinortho diamond==2.1.10 
+```
+
+NB:Had to downgrade `diamond` to 2.1.10 for some reason.
+https://github.com/bbuchfink/diamond/issues/855
+
+Then, if you `cd /projects/$USER/miniforge3/envs` you will see your generated env. 
+
+```{bash other envs to install}
+mamba create -y -n muscle_env -c bioconda muscle
+mamba create -y -n trimal_env trimal
+mamba create -y -n bioperl_env -c bioconda perl-bioperl
+mamba create -y -n raxml_env raxml
+mamba create -y -n iqtree_env iqtree
+```
+
+Okay so now everything is set up we can start the pylogenomic tree pipeline. 
+
+
+## 1. Proteome Selection 
+
+So this is obviously up to the user. But you want to have *proteomes* of the species (newly generated or whatever) to run your tree. 
+
+You can find these on NCBI, JGI, or from user generated ones. For this tutorial, I have selected 5 coral proteomes for us to use. <br>
+- *Acropora millepora* <br>
+- *Acropora digitfera* <br>
+- *Acropora cervicornis* <br>
+- *Orbicella faveolata* <br>
+- *Nematostella vectensis* (outgroup) <br>
+
+There are many ways to get genomes from repositories, for example NCBI has a toolkit you can use and download via accession number. You can also just download manually yourself. This is completely up to the user. 
+
+I have put this on the peta library, so people can copy them if they want to try running this pipeline. 
+
+`/pl/active/fungi1/coral_proteomes`
+
+To get these, we will do the following 
+
+```{bash go to scratch space and make a new project directory}
+cd /scratch/alpine/$USER/
+mkdir temp
+mkdir phylo_tutorial
+mkdir phylo_tutorial/proteomes
+mkdir phylo_tutorial/proteinortho
+mkdir phylo_tutorial/ortho_proteins
+
+cp -r /pl/active/fungi1/coral_proteomes/* /scratch/alpine/$USER/phylo_tutorial/proteomes
+```
+
+If you are trying this little workthrough and do not have access to the files, here are their links. You will want to download the proteomes, and rename them to the names specified. 
+- https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_013753865.1/ (*Acropora Millepora*) - Amil_prot.fa <br>
+- https://zenodo.org/records/10151798 (*Orbicella faveolata*) - Ofav_prot.fa <br>
+- https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_000222465.1/ (*Acropora digitfera*) - Adig_prot.fa <br>
+- https://www.ncbi.nlm.nih.gov/datasets/genome/GCA_032359415.1/ (*Acropora cervicornis*) - Acer_prot.fa <br>
+- https://www.ncbi.nlm.nih.gov/datasets/genome/GCF_932526225.1/ (*Nematostella vectensis*) - Nvec_prot.fa <br>
+
+
+## 2. Getting Orthologs
+
+We will be using `proteinortho` for this. We have already generated our environment so we just need to submit a slurm job and run it woop.
+
+A notable step here as well is to make sure all your proteomes have logical names, and that the proteins inside do not have a really long name, this can mess up donwstream steps. I renamed the main files here, but we will do the protein renaming. 
+
+For the proteins within the files, this can be a bit trickier. This little script should work on all proteomes. It
+1. writes the first part of the proteome file as thje name
+2. adds 1,2,3 etc  sequentially for the proteins. 
+3. adds a | at the end to stop weird numbering problems. 
+
+```{bash renaming proteins within the files}
+cd /scratch/alpine/$USER/phylo_tutorial/proteomes
+for file in *.fa; do
+    base=$(basename "$file" | cut -d. -f1) # Get the base name without extension
+    awk -v prefix="${base}_" '{
+        if (substr($0, 1, 1) == ">") {
+            count++
+            # Create the new header format with sequential numbering
+            printf(">%s%d|\n", prefix, count)
+        } else {
+            print $0
+        }
+    }' "$file" > "${file}.modified" # Output to a new file with .modified suffix
+done
+```
+
+I am not going into slurm jobs, but their is good documentation on the RC page if you do not know about stuff and want to learn about it. 
+
+https://curc.readthedocs.io/en/latest/
+
+MAKE SURE YOU CHANGE THE `#SBATCH --mail-user=xxx` so I do not get a load of emails. Also, you can put Gus email there if you want to spam him. 
+
+Proteinortho documentation
+- https://gitlab.com/paulklemm_PHD/proteinortho
+
+First, logon to the supercomputer
+
+```{bash}
+ssh $USER@login.rc.colorado.edu
+```
+
+As we are running on blanca, we need to switch to the blanca slurm manager 
+
+```{bash switchin to blanca slurm manager}
+module load slurm/blanca
+```
+
+To switch back to alpine it is `module load slurm/alpine`. 
+
+```{bash proteinortho job}
+#!/bin/bash
+#SBATCH --time=16:00:00
+#SBATCH --qos=blanca-qsmicrobes
+#SBATCH --partition=blanca-qsmicrobes
+#SBATCH --account=blanca-qsmicrobes
+#SBATCH --nodes=1
+#SBATCH --mem=50G
+#SBATCH --job-name=protortho
+#SBATCH --error=/scratch/alpine/$USER/phylo_tutorial/proteinortho/protortho.err
+#SBATCH --output=/scratch/alpine/$USER/phylo_tutorial/proteinortho/protortho.out
+#SBATCH --mail-type=ALL
+#SBATCH --ntasks=10
+#SBATCH --cpus-per-task=2
+#SBATCH --mail-user=$USER@colorado.edu
+
+## loading the proteinortho env in the script, need these three lines
+module purge 
+eval "$(conda shell.bash hook)"
+conda activate proteinortho_env
+
+## going to our project directory with proteinortho, we running from this directory so ouput goes here. 
+cd /scratch/alpine/$USER/phylo_tutorial/proteinortho
+
+## running proteinortho
+proteinortho6.pl \
+-project=phylo_tutorial \
+-cpus=20 \
+--temp=/scratch/alpine/$USER/temp \
+/scratch/alpine/beyo2625/phylo_tutorial/proteomes/*modified
+```
+
+To see progress of job - `squeue -u $USER` (obvs your username not mine). 
+
+Okay, so if you are a windows computer, if you copy and paste it'll be weird. What you need to do is 
+1. copy the script
+2. nano
+3. paste it in 
+4. save it 
+5. run `dos2unix <filename)` and this will then work in `sbatch`. 
+
+
+## 2. Identyfying and Extracting Orthologs
+
+So it is always good to know how many proteomes we put in, as the results file we will want the column with these numbers as these are single copy orthologs (SCOs). 
+
+How many proteomes do we have total. 
+
+```{bash identyfying how many proteomes we have}
+cd /scratch/alpine/$USER/phylo_tutorial/proteomes
+ls *.fa | wc -l
+```
+
+So we have *5*, we need to then extract the 5th column from the `proteinortho` results for SCO in all species. 
+
+```{bash getting SCO from the protein ortho results}
+cd /scratch/alpine/$USER/phylo_tutorial/proteinortho
+awk 'BEGIN {OFS="\t"} /^#/ {print} $1==5 && $2==5 {print}' phylo_tutorial.proteinortho.tsv > SCO_all.tsv
+## extracting the row were columns 1 and 2 have the value 7 in them. 
+wc -l SCO_all.tsv ## seeing how many SCOs we have to work with. 
+```
+
+So this is the point in the pipeline where you need to work out if this is a good enough number of SCOs to move forward with. We get *3326* which is super nice. So yay. 
+
+For example, in the Laboul project at this point I got 3, so I had 3 SCO between all my species (~55 species). This is not enough for pylogenomic estimation. So I had to extract SCOs in greater than 90% species. This resulted in 826 SCO>90% which was much better and usable.
+
+I have included some these steps and while we wont use their output, we can run them to see how it looks. 
+
+Working out the percentages for SCO in a certain number of the species. 
+
+```{r working out different percentages for SCO in greater than x percent of species}
+(7/100) * 90
+(7/100) * 80
+(7/100) * 70
+(7/100) * 60
+(7/100) * 50
+```
+
+```{bash getting SCOS in greater than x percent}
+cd /scratch/alpine/$USER/phylo_tutorial/proteinortho
+awk '$1 == $2 && $1 > 6' phylo_tutorial.proteinortho.tsv > SCO_great90p.txt
+awk '$1 == $2 && $1 > 5' phylo_tutorial.proteinortho.tsv > SCO_great80p.txt
+awk '$1 == $2 && $1 > 4' phylo_tutorial.proteinortho.tsv > SCO_great70p.txt
+awk '$1 == $2 && $1 > 3' phylo_tutorial.proteinortho.tsv > SCO_great50p.txt
+```
+
+And then, we can see how many SCOs we have in all the generated files. 
+
+```{bash number of SCOs in percentages}
+wc -l SCO*
+```
+
+And wonderful, you could then make a choice on which one you wanted to do. For us, we are going to use all SCO (i.e. the main output from `proteinortho`) and move on. 
+
+```{bash all SCOs from coral speceis}
+#!/bin/bash
+#SBATCH --time=12:00:00
+#SBATCH --qos=blanca-qsmicrobes
+#SBATCH --partition=blanca-qsmicrobes
+#SBATCH --account=blanca-qsmicrobes
+#SBATCH --nodes=1
+#SBATCH --mem=50G
+#SBATCH --job-name=grabprots_90perc
+#SBATCH --error=/scratch/alpine/$USER/phylo_tutorial/proteinortho/grabprots.err
+#SBATCH --output=/scratch/alpine/$USER/phylo_tutorial/proteinortho/grabprots.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=$USER@colorado.edu
+#SBATCH --ntasks=10
+#SBATCH --cpus-per-task=2
+
+module purge 
+eval "$(conda shell.bash hook)"
+conda activate proteinortho_env
+
+cd /scratch/alpine/$USER/phylo_tutorial
+proteinortho_grab_proteins.pl \
+-exact \
+-cpus=20 \
+-tofiles=/scratch/alpine/$USER/phylo_tutorial/ortho_proteins \
+proteinortho/SCO_all.tsv \
+proteomes/*.fa.modified
+```
+
+And once done to see how many files in the directory
+
+```{bash checking processing of sco}
+cd /scratch/alpine/$USER/phylo_tutorial/ortho_proteins
+ls | wc -l
+```
+
+
+## 3. Aligning the SCOs
+
+There are alot of SCOs here, so we are going to subset to 100ish for the remainder of the tutorial so things run faster yay. 
+
+```{bash selecting 100 SCOs for the tutorial}
+cd /scratch/alpine/$USER/phylo_tutorial
+mkdir ortho_proteins_tut
+ls /scratch/alpine/$USER/phylo_tutorial/ortho_proteins > all_scos.txt
+shuf all_scos.txt | head -n 100 > sample_scos.txt
+xargs -a sample_scos.txt -I{} cp /scratch/alpine/$USER/phylo_tutorial/ortho_proteins/{} ortho_proteins_tut/
+ls ortho_proteins_tut | wc -l ## gives 100 yay
+rm -rf ortho_proteins
+mv ortho_proteins_tut ortho_proteins
+```
+
+So to do this we will use `muscle`. For this, we want to run an alignment job for each identified SCO. Therefore, however many SCO you get is however many jobs you will be running. On the supercomputer, your maximum job submission at any one time is 1000. This does not matter here, but if we did the full ~3000 you need to do 3 submissions. 
+
+```{bash making directories}
+cd /scratch/alpine/$USER/phylo_tutorial
+mkdir align
+mkdir align/loop_err_out
+```
+
+This script below may be confusing, but theoretically it is very simple. You are submitting a job to the supercomputer which writes a script for each value in a variable, and then submits that job. So in essence it is parallel computing. 
+
+```{bash alining only SCOs in 90 percent or greater}
+#!/bin/bash
+#SBATCH --time=00:10:00
+#SBATCH --qos=blanca-qsmicrobes
+#SBATCH --partition=blanca-qsmicrobes
+#SBATCH --account=blanca-qsmicrobes
+#SBATCH --nodes=1
+#SBATCH --mem=2G
+#SBATCH --job-name=muscle
+#SBATCH --error=/scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/muscle.err
+#SBATCH --output=/scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/muscle.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=$USER@colorado.edu
+
+cd /scratch/alpine/$USER/phylo_tutorial/ortho_proteins
+PALMATA=$(ls *.fasta)
+
+echo "files going through mucle5 alignment"
+echo $PALMATA
+
+for PALPAL in $PALMATA
+do
+echo "$PALPAL"
+echo '#!/bin/bash' > /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --qos=blanca-qsmicrobes' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --partition=blanca-qsmicrobes' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --account=blanca-qsmicrobes' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --time=02:00:00' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --nodes=1' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --mem=10G' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --ntasks=5' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --cpus-per-task=2' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --job-name='"$PALPAL"'_muscle' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --error=/scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/'"$PALPAL"'_muscle.err' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --output=/scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/'"$PALPAL"'_muscle.out' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --mail-type=ALL' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo '#SBATCH --mail-user=$USER@colorado.edu' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+
+echo 'module purge' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo 'eval "$(conda shell.bash hook)"' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+echo 'conda activate muscle_env' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+
+echo 'cd /scratch/alpine/$USER/phylo_tutorial' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+
+echo 'muscle \
+-super5 ortho_proteins/'"${PALPAL}"' \
+-output align/'"${PALPAL}"'.out' >> /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+sbatch /scratch/alpine/$USER/phylo_tutorial/align/loop_err_out/"$PALPAL"_muscle.sh
+done
+```
+
+Once these have all run (i.e. you get the emails saying completed), you can check to make sure everything ran well. 
+
+```{bash checking to make sure all files processed}
+cd /scratch/alpine/$USER/phylo_tutorial/align
+ls *.out | wc -l
+## should give the number of SCOs you have identified, 100 for this tutorial 
+```
+
+
+## 4. Cleaning the Alignments
+
+This is probably the easiest step of everything. You are cleaning the alignmnets you generated in `muscle` using `trimal`. 
+
+```{bash first making directories fro trimming}
+cd /scratch/alpine/$USER/phylo_tutorial
+mkdir clean
+```
+
+Also note how the script below has a for loop in it BUT it is only one job (i.e. not like the last one which submitted alot of jobs to the supercomputer). `Trimal` runs really quick so we just need one job. This is an example of a sequential job where it runs 1 script and iterates through all the files in a row. 
+
+```{bash running trimal on aligned SCO}
+#!/bin/bash
+#SBATCH --time=12:00:00
+#SBATCH --account=ucb423_asc2
+#SBATCH --nodes=1
+#SBATCH --mem=40G
+#SBATCH --job-name=trimal
+#SBATCH --error=/scratch/alpine/beyo2625/phylo_tutorial/clean/trimal.err
+#SBATCH --output=/scratch/alpine/beyo2625/phylo_tutorial/clean/trimal.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=beyo2625@colorado.edu
+#SBATCH --ntasks=10
+#SBATCH --cpus-per-task=2
+
+module purge 
+eval "$(conda shell.bash hook)"
+conda activate trimal_env
+
+## making a variable of all the file names. 
+cd /scratch/alpine/$USER/phylo_tutorial/align
+PALMATA=$(ls *.out)
+
+cd /scratch/alpine/$USER/phylo_tutorial
+
+for PALPAL in $PALMATA
+do
+trimal \
+-in align/"$PALPAL" \
+-out clean/"$PALPAL".trim \
+-gappyout
+done
+```
+
+```{bash checking all fastas present}
+cd /scratch/alpine/$USER/phylo_tutorial/clean
+ls *.trim | wc -l
+## should give the same SCO number we have had the whole time. 
+```
+
+So, if you had chosen to use the SCO in >xx% species, this is where you have to run a few extra steps. We are not going to do this, but I have included these here for sake of completeness. It is a little more complicated. 
+
+
+#### 4.1 Compelting Orthologs so all species present. 
+
+*NOT DOING THIS STEP IT JUST HERE AS AN EXAMPLE*
+
+So if you used the greater then xx% orthologs, some of these files will be missing species (as they did not have the ortholog present). For `RAxML` we need to have all orthologs in the same order. So if there is a species missing in a ortholog, we need to add it in to that ortholog and add a padding sequence that is the same length as the aligned clean read lengths. 
+
+This first chunk is making a file with all the species you are using. 
+
+```{bash making expected file of all species}
+cd /scratch/alpine/$USER/phylo_tutorial/clean
+cat *.fasta.out.trim | grep "^>" | tr "_" "\t" | cut -f 1 | sort | uniq > ../expected.txt
+wc -l ../expected.txt
+## should give number of species you are using and is the name of the proteines in the fasta files
+```
+
+Now we have done that, we need to complete entries for missing species in orhtologs.
+
+```{bash making the 105 species list}
+# Create a list of all species
+cd /scratch/alpine/$USER/phylo_tutorial
+ls proteomes/*modified | sed 's|proteomes/||; s|\.aa\.fasta\.modified||' > species_list.txt
+wc -l species_list.txt ##again should give the number of species we expecting
+```
+
+```{bash making complete directory}
+cd /scratch/alpine/$USER/phylo_tutorial
+mkdir complete
+```
+
+```{bash completing the orthogroups so all species present with padding sequences}
+# Path to required things
+species_file="/scratch/alpine/$USER/phylo_tutorial/species_list.txt"
+orthogroup_dir="/scratch/alpine/$USER/phylo_tutorial/clean"
+output_dir="/scratch/alpine/$USER/phylo_tutorial/complete"
+line_length=60
+
+for orthogroup in "$orthogroup_dir"/*.out.trim; do
+    echo "Processing $orthogroup"
+    
+    # Extract existing species from the orthogroup file
+    existing_species=$(grep ">" "$orthogroup" | sed 's/>//; s/_.*//')
+
+    # Read species into an array
+    readarray -t all_species < "$species_file"
+
+    # Create an array to hold missing species
+    missing_species=()
+
+    # Identify missing species
+    for species in "${all_species[@]}"; do
+        if ! printf '%s\n' "${existing_species[@]}" | grep -q "^$species$"; then
+            missing_species+=("$species")
+        fi
+    done
+
+    # Get the maximum length of sequences in the orthogroup
+    max_length=0
+    current_length=0
+    while read -r line; do
+        if [[ "$line" == \>* ]]; then
+            if (( current_length > max_length )); then
+                max_length=$current_length
+            fi
+            current_length=0  # Reset for next sequence
+        else
+            current_length=$((current_length + ${#line}))
+        fi
+    done < "$orthogroup"
+
+    # Check the last sequence's length
+    if (( current_length > max_length )); then
+        max_length=$current_length
+    fi
+
+    # Create a new file path for the modified orthogroup
+    output_file="$output_dir/$(basename "$orthogroup")"
+
+    # Copy the original orthogroup content to the new file
+    cp "$orthogroup" "$output_file"
+
+    # Add missing species to the new orthogroup file
+    for species in "${missing_species[@]}"; do
+        echo "Adding missing species: $species"
+        # Add species header
+        echo ">${species}_00|" >> "$output_file"
+        
+        # Create the padded sequence with dashes
+        padding=$(printf '%*s' "$max_length" | tr ' ' '-')
+
+        # Split the padded sequence into lines of 60 characters
+        while [ -n "$padding" ]; do
+            echo "${padding:0:60}" >> "$output_file"
+            padding="${padding:60}"
+        done
+    done
+done
+```
+
+This should print in the terminal which species are missing and that it is adding them in. 
+
+Once this is done, it is always good to make sure everything looks good. This following chunk makes sure all the sequence lengths are the same for a subset of the files. 
+
+```{bash shows whether all the sequences are the same length for each orthogroup}
+cd /scratch/alpine/$USER/phylo_tutorial/complete
+awk '/^>/ { if (seqlen > 0) print header, seqlen; header=$0; seqlen=0; next } { seqlen += length($0) } END { if (seqlen > 0) print header, seqlen }' XXXXX.fasta.out.trim
+## all the same
+
+awk '/^>/ { if (seqlen > 0) print header, seqlen; header=$0; seqlen=0; next } { seqlen += length($0) } END { if (seqlen > 0) print header, seqlen }' XXXXXX.fasta.out.trim
+## all the same
+
+awk '/^>/ { if (seqlen > 0) print header, seqlen; header=$0; seqlen=0; next } { seqlen += length($0) } END { if (seqlen > 0) print header, seqlen }' XXXXX.fasta.out.trim
+## all the same
+```
+
+And that is what you need to do to complete entries before combining all the SCO woooooop. 
+
+
+## 5. Concatenation of Everything. 
+
+There are a few ways you can do this, but I like the way I have developed. I wrote a script called `combine.pl` which combines the the SCO for each species into one mega sequence, and then puts all the different species into one file. It then prints out the length of the total alignmentt of each species to make sure things look good. 
+
+```
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# Check command-line arguments
+my ($expected_file, $output_file, @ortholog_files) = @ARGV;
+die("Usage: $0 <expected_file> <output_file> <ortholog_files...>\n") unless @ortholog_files;
+
+# Read expected species identifiers
+my %expected;
+open(my $efh, '<', $expected_file) or die "Could not open '$expected_file': $!";
+while (<$efh>) {
+    chomp;
+    s/^>//;  # Remove '>'
+    $expected{$_} = "";  # Initialize with empty string
+}
+close($efh);
+
+# Concatenate sequences for each species
+foreach my $ortholog_file (@ortholog_files) {
+    open(my $ofh, '<', $ortholog_file) or die "Could not open '$ortholog_file': $!";
+    my $current_species = '';
+    my $current_sequence = '';
+
+    while (<$ofh>) {
+        chomp;
+        if (/^>([^_]+)_prot_\d+\|/) {
+            # If we encounter a new header, save the current species sequence
+            if ($current_species && exists $expected{$current_species}) {
+                $expected{$current_species} .= $current_sequence;  # Append sequence
+            }
+
+            $current_species = $1;  # Get species name (spp)
+            $current_sequence = '';  # Reset for new species
+        } elsif ($current_species) {
+            $current_sequence .= $_;  # Build sequence
+        }
+    }
+
+    # Save the last species sequence
+    if ($current_species && exists $expected{$current_species}) {
+        $expected{$current_species} .= $current_sequence;
+    }
+
+    close($ofh);
+}
+
+# Write concatenated sequences and their lengths to output file
+open(my $outfh, '>', $output_file) or die "Could not open '$output_file': $!";
+foreach my $species (keys %expected) {
+    my $sequence = $expected{$species};
+    my $length = length($sequence);  # Get length of the concatenated sequence
+    print $outfh ">$species\n$sequence\n";  # Write species and its concatenated sequence
+    print "$species: $length bp\n";  # Print length to console
+}
+close($outfh);
+
+print "Concatenated FASTA file created: $output_file\n";
+```
+
+So we are going to copy and paste this script into a file using `nano`
+
+```{bash making the combine program on the supercomputer}
+cd /scratch/alpine/$USER/phylo_tutorial
+nano
+## 1. Copy and paste into the terminal
+## 2. ctrl x
+## 3. y, and then name the file "combine.pl"
+ls
+chmod +x combine.pl
+```
+
+You will see all your directories and the new file we made wooooop.
+
+*N.B* - this script above is not robust to any naming schemes. I need to make it robust or have the pipeline that when you name the proteins at the start, this will then work. I will try to do this so there is a pipeline that can be run by all. You need to have your file as **[name]_prot.fa** for this to work. If you have a different naming scheme for your proteomes, you need to edit this line in the `combine.pl` to make it work. Specifically the `if ()` bit. 
+
+```
+    while (<$ofh>) {
+        chomp;
+        if (/^>([^_]+)_prot_\d+\|/) {
+            # If we encounter a new header, save the current species sequence
+            if ($current_species && exists $expected{$current_species}) {
+                $expected{$current_species} .= $current_sequence;  # Append sequence
+            }
+```
+
+Now need to make the expected file as it uses this to loop through the species. 
+
+```{bash making expected file of all species for concatenation}
+cd /scratch/alpine/$USER/phylo_tutorial/clean
+cat *.fasta.out.trim | grep "^>" | tr "_" "\t" | cut -f 1 | sort | uniq > ../expected.txt
+cd ../
+wc -l ../expected.txt
+## should give number of species you are using and is the name of the proteins in the fasta files
+```
+
+Now, we can use this script and run on our aligned, cleaned (and if >xx% completed) orthologs yay. 
+
+```{bash SCO all species}
+mamba activate bioperl_env
+cd /scratch/alpine/$USER/phylo_tutorial
+
+./combine.pl \
+expected.txt \
+concat_sco.fasta \
+clean/SCOall.tsv.OrthoGroup*
+
+ls
+```
+
+And we should have our file ready for `RAxML` woooooooooo. 
+
+
+## 6. Tree Generation
+
+So `RAxML` can take a while. So it is best to run on our blanca node with 168 hours (i.e. max runtime allowed) or on amilan with the `--long qos` and 168 hours (max) again. 
+
+```{bash}
+cd /scratch/alpine/$USER/phylo_tutorial
+mkdir raxml_tree
+```
+
+```{bash running the greater 90 sco for the multiclass with root}
+#!/bin/bash
+#SBATCH --time=168:00:00
+#SBATCH --qos=blanca-qsmicrobes
+#SBATCH --partition=blanca-qsmicrobes
+#SBATCH --account=blanca-qsmicrobes
+#SBATCH --nodes=1
+#SBATCH --mem=40G
+#SBATCH --job-name=raxml_g90
+#SBATCH --error=/scratch/alpine/$USER/phylo_tutorial/raxml_tree/raxml.err
+#SBATCH --output=/scratch/alpine/$USER/phylo_tutorial/raxml_tree/raxml.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=$USER@colorado.edu
+#SBATCH --ntasks=10
+#SBATCH --cpus-per-task=2
+
+module purge 
+eval "$(conda shell.bash hook)"
+conda activate raxml_env
+
+cd /scratch/alpine/$USER/phylo_tutorial/raxml_tree
+
+raxmlHPC-PTHREADS-AVX2 \
+-f a \
+-s ../concat_sco.fasta \
+-n coral_SCO_tree \
+-m PROTGAMMAAUTO \
+-x 8212 \
+-N 100 \
+-p 1176 \
+-T 20 \
+-o Nmat ## this roots in raxml which can be very useful if you use treeio and r for tree plotting. 
+```
+
+And that's it, now you can visualize your tree and do all the things wooooooo. To download the tree do the following `scp`. 
+
+```{bash downloading things}
+scp -r beyo2625@login.rc.colorado.edu:/scratch/alpine/beyo2625/phylo_tutorial/raxml_tree ./
+```
+
+Hopefully this was helpful :).
